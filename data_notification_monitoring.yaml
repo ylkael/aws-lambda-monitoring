@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  This template creates monitoring for Data Notification
+
+Parameters:
+  CustomerName:
+    Type: String
+    Description: Name of the Customer
+
+  SolutionName:
+    Type: String
+    Description: Solution name
+
+  EnvironmentName:
+    Description: Project Environment for Tagging Purposes
+    ConstraintDescription: "Choose an Environment from the drop down"
+    Type: String
+    AllowedValues:
+      - "sandbox"
+      - "dev"
+      - "prod"
+
+  ComponentName:
+    Type: String
+    Description: Component name
+    Default: DataNotificationMonitoring
+
+  LambdaFunctionS3BucketName:
+    Description: "Name of the lambda s3 bucket"
+    ConstraintDescription: "Choose s3-bucket for Lambda source code"
+    Type: String
+    AllowedValues:
+      - lambda-code-src-bucket-sandbox
+      - lambda-code-src-bucket-dev
+      - lambda-code-src-bucket-prod
+ 
+  LambdaFunctionS3Key:
+    Description: File which holds the function code
+    Type: String
+    Default: data_notification_monitoring.zip
+
+  LambdaSubnet:
+    Description: Subnet for the Lambda function to use.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  LambdaSG:
+    Description: Security group for the Lambda function to use.
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+Mappings:
+  LicenseAPIURLMap:
+    sandbox:
+      "URL": "https://.../data-notifications/OrganisationDataNotification/status"
+    dev:
+      "URL": "https://.../data-notifications/OrganisationDataNotification/status"
+    prod:
+      "URL": "https://.../data-notifications/OrganisationDataNotification/status"
+ 
+
+Resources:
+  DataNotificationMonitoringLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Checks Data Notification for API is working
+      Handler: "data_notification_monitoring.lambda_handler"
+      Role: !GetAtt DataNotificationMonitoringLambdaRole.Arn
+      MemorySize: 128
+      Runtime: "python3.7"
+      FunctionName: !Ref ComponentName
+      Timeout: 5
+      VpcConfig:
+        SecurityGroupIds: !Ref LambdaSG
+        SubnetIds: !Ref LambdaSubnet
+      Environment:
+        Variables:
+          LicenseAPIURL: !FindInMap [LicenseAPIURLMap, !Ref EnvironmentName, URL]
+          APIKey: "/monitoring/Connect"
+      Tags:
+        - Key: "project"
+          Value: !Ref ComponentName
+      Code:
+        S3Bucket: !Ref LambdaFunctionS3BucketName
+        S3Key: !Ref LambdaFunctionS3Key
+
+  DataNotificationMonitoringLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ComponentName}-LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowLambdaVPC
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "cloudwatch:PutMetricData"
+                  - "sns:Publish"
+                Resource: '*'
+      ManagedPolicyArns: 
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  DataNotificationMonitoringSecretsManagerAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ComponentName}-SecretsManagerAccessPolicy'
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - kms:Decrypt
+              - secretsmanager:GetSecretValue
+            Resource: "*"
+      Roles:
+        - Ref: "DataNotificationMonitoringLambdaRole"
+
+  DataNotificationMonitoringRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: !Sub '${ComponentName}-Rule'
+      Description: "This rule schedules Data Notification Lambda"
+      ScheduleExpression: "rate(15 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt DataNotificationMonitoringLambda.Arn
+          Id: DataNotificationMonitoringLambda
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "DataNotificationMonitoringLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DataNotificationMonitoringRule.Arn
+
+  DataNotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: DataNotificationTopic
+
+  DataNotificationSubscriptionEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DataNotificationSNSTopic
+      Endpoint: example@example.fi
+      Protocol: email
+  
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: allow-publish
+          Effect: Allow
+          Principal:
+            Service: 
+              - cloudwatch.amazonaws.com
+          Action: sns:Publish
+          Resource: "*"
+      Topics:
+      - !Ref DataNotificationSNSTopic
+
+  DataNotificationMonitoringTriggerActiveAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Data Notification Monitoring TriggerActive Status
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-TriggerActive"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True
+      AlarmActions: 
+          - !Ref DataNotificationSNSTopic
+      OKActions:
+          - !Ref DataNotificationSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: data_notification_triggeractive
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "DataNotification"
+                  Value: "triggerActive"
+              MetricName: "DataNotificationTriggeractive"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum
+
+  DataNotificationMonitoringProcessingStatusAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Data Notification Monitoring ProcessingStatus Status
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-ProcessingStatus"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True 
+      AlarmActions: 
+          - !Ref DataNotificationSNSTopic
+      OKActions:
+          - !Ref DataNotificationSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: data_notification_processingstatus
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "DataNotification"
+                  Value: "processingStatus"
+              MetricName: "DataNotificationProcessingstatus"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum

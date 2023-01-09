@@ -1,4 +1,4 @@
-# AWS Lambda monitoring
+# AWS Lambda monitoring for Application Data Notification
 
 Monitoring the status of data notifications from Rest API endpoint.
 
